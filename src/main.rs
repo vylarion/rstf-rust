@@ -10,9 +10,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::min;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -59,9 +59,22 @@ enum Commands {
 }
 
 // Credential Processing Helper
-fn process_credentials(salt: &[u8], keyfile_path: Option<PathBuf>) -> Result<[u8; 32]> {
+fn process_credentials(
+    salt: &[u8],
+    keyfile_path: Option<PathBuf>,
+    confirm_password: bool,
+) -> Result<[u8; 32]> {
     let mut password =
         rpassword::prompt_password("Enter password: ").context("Failed to read password")?;
+
+    if confirm_password {
+        let confirm = rpassword::prompt_password("Confirm password: ")
+            .context("Failed to read password confirmation")?;
+        if password != confirm {
+            password.zeroize();
+            anyhow::bail!("Passwords do not match. Aborting.");
+        }
+    }
 
     let mut combined_credentials = password.as_bytes().to_vec();
 
@@ -86,10 +99,54 @@ fn process_credentials(salt: &[u8], keyfile_path: Option<PathBuf>) -> Result<[u8
     Ok(key)
 }
 
+fn secure_wipe_file(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata for: {}", path.display()))?;
+    let size = metadata.len();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Failed to open for wiping: {}", path.display()))?;
+
+    let mut rng = rand::thread_rng();
+    let mut buf = [0u8; 64 * 1024];
+    let mut remaining = size;
+    while remaining > 0 {
+        let to_write = min(remaining as usize, buf.len());
+        rng.fill(&mut buf[..to_write]);
+        file.write_all(&buf[..to_write])?;
+        remaining -= to_write as u64;
+    }
+    file.sync_all()?;
+    drop(file);
+
+    fs::remove_file(path)
+        .with_context(|| format!("Failed to remove after wiping: {}", path.display()))?;
+    Ok(())
+}
+
+fn secure_wipe_path(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata for: {}", path.display()))?;
+
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            secure_wipe_path(&entry.path())?;
+        }
+        fs::remove_dir(path)
+            .with_context(|| format!("Failed to remove directory: {}", path.display()))?;
+    } else {
+        secure_wipe_file(path)?;
+    }
+    Ok(())
+}
+
 struct EncryptedWriter<W: Write> {
     inner: W,
-    encryptor: EncryptorBE32<ChaCha20Poly1305>,
+    encryptor: Option<EncryptorBE32<ChaCha20Poly1305>>,
     buffer: Vec<u8>,
+    finalized: bool,
 }
 
 // EncryptedWriter Implementation
@@ -97,17 +154,22 @@ impl<W: Write> EncryptedWriter<W> {
     fn new(inner: W, encryptor: EncryptorBE32<ChaCha20Poly1305>) -> Self {
         Self {
             inner,
-            encryptor,
+            encryptor: Some(encryptor),
             buffer: Vec::with_capacity(CHUNK_SIZE),
+            finalized: false,
         }
     }
 
-    fn flush_chunk(&mut self, final_chunk: bool) -> std::io::Result<()> {
-        if self.buffer.is_empty() && !final_chunk {
+    fn flush_intermediate(&mut self) -> std::io::Result<()> {
+        if self.buffer.is_empty() {
             return Ok(());
         }
-        let ciphertext = self
-            .encryptor
+
+        let encryptor = self.encryptor.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Stream already finalized")
+        })?;
+
+        let ciphertext = encryptor
             .encrypt_next(self.buffer.as_slice())
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Encryption failed"))?;
 
@@ -115,11 +177,40 @@ impl<W: Write> EncryptedWriter<W> {
         self.buffer.clear();
         Ok(())
     }
+
+    fn finalize(&mut self) -> std::io::Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+
+        let encryptor = self.encryptor.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Stream already finalized")
+        })?;
+
+        let ciphertext = encryptor
+            .encrypt_last(self.buffer.as_slice())
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "Final encryption failed")
+            })?;
+
+        self.inner.write_all(&ciphertext)?;
+        self.buffer.clear();
+        self.inner.flush()?;
+        Ok(())
+    }
 }
 
 // Write Trait for EncryptedWriter
 impl<W: Write> Write for EncryptedWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.finalized {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Cannot write to finalized stream",
+            ));
+        }
+
         let mut total_written = 0;
         while total_written < buf.len() {
             let space_left = CHUNK_SIZE - self.buffer.len();
@@ -129,14 +220,13 @@ impl<W: Write> Write for EncryptedWriter<W> {
             total_written += to_copy;
 
             if self.buffer.len() == CHUNK_SIZE {
-                self.flush_chunk(false)?;
+                self.flush_intermediate()?;
             }
         }
         Ok(total_written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.flush_chunk(true)?;
         self.inner.flush()
     }
 }
@@ -144,16 +234,19 @@ impl<W: Write> Write for EncryptedWriter<W> {
 // Drop Trait for EncryptedWriter
 impl<W: Write> Drop for EncryptedWriter<W> {
     fn drop(&mut self) {
-        let _ = self.flush_chunk(true);
+        if !self.finalized {
+            let _ = self.finalize();
+        }
     }
 }
 
 struct DecryptedReader<R: Read> {
     inner: R,
-    decryptor: DecryptorBE32<ChaCha20Poly1305>,
-    buffer: Vec<u8>,
+    decryptor: Option<DecryptorBE32<ChaCha20Poly1305>>,
+    plaintext_buffer: Vec<u8>,
     offset: usize,
     eof: bool,
+    staged_ciphertext: Option<Vec<u8>>,
 }
 
 // DecryptedReader Implementation
@@ -161,60 +254,95 @@ impl<R: Read> DecryptedReader<R> {
     fn new(inner: R, decryptor: DecryptorBE32<ChaCha20Poly1305>) -> Self {
         Self {
             inner,
-            decryptor,
-            buffer: Vec::new(),
+            decryptor: Some(decryptor),
+            plaintext_buffer: Vec::new(),
             offset: 0,
             eof: false,
+            staged_ciphertext: None,
         }
+    }
+
+    fn read_encrypted_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let encrypted_chunk_size = CHUNK_SIZE + 16;
+        let mut buf = vec![0u8; encrypted_chunk_size];
+
+        let mut read_bytes = 0;
+        while read_bytes < encrypted_chunk_size {
+            match self.inner.read(&mut buf[read_bytes..]) {
+                Ok(0) => break,
+                Ok(n) => read_bytes += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if read_bytes == 0 {
+            Ok(None)
+        } else {
+            buf.truncate(read_bytes);
+            Ok(Some(buf))
+        }
+    }
+
+    fn decrypt_next_chunk(&mut self) -> std::io::Result<bool> {
+        if self.staged_ciphertext.is_none() {
+            self.staged_ciphertext = self.read_encrypted_chunk()?;
+            if self.staged_ciphertext.is_none() {
+                self.eof = true;
+                return Ok(false);
+            }
+        }
+
+        let next_chunk = self.read_encrypted_chunk()?;
+        let staged = self.staged_ciphertext.take().unwrap();
+
+        let plaintext = if next_chunk.is_none() {
+            self.eof = true;
+            let decryptor = self.decryptor.take().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "Decryptor already consumed")
+            })?;
+            decryptor.decrypt_last(staged.as_slice()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Decryption failed (MAC Error)",
+                )
+            })?
+        } else {
+            let decryptor = self.decryptor.as_mut().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "Decryptor already consumed")
+            })?;
+            let result = decryptor.decrypt_next(staged.as_slice()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Decryption failed (MAC Error)",
+                )
+            })?;
+            self.staged_ciphertext = next_chunk;
+            result
+        };
+
+        self.plaintext_buffer = plaintext;
+        self.offset = 0;
+        Ok(true)
     }
 }
 
 // Read Trait for DecryptedReader
 impl<R: Read> Read for DecryptedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.offset >= self.buffer.len() {
+        if self.offset >= self.plaintext_buffer.len() {
             if self.eof {
                 return Ok(0);
             }
-
-            let encrypted_chunk_size = CHUNK_SIZE + 16;
-            let mut encrypted_buf = vec![0u8; encrypted_chunk_size];
-
-            let mut read_bytes = 0;
-            while read_bytes < encrypted_chunk_size {
-                match self.inner.read(&mut encrypted_buf[read_bytes..]) {
-                    Ok(0) => break,
-                    Ok(n) => read_bytes += n,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
-                }
-            }
-
-            if read_bytes == 0 {
-                self.eof = true;
+            if !self.decrypt_next_chunk()? {
                 return Ok(0);
-            }
-
-            let chunk_to_decrypt = &encrypted_buf[..read_bytes];
-
-            let plaintext = self.decryptor.decrypt_next(chunk_to_decrypt).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Decryption failed (MAC Error)",
-                )
-            })?;
-
-            self.buffer = plaintext;
-            self.offset = 0;
-
-            if read_bytes < encrypted_chunk_size {
-                self.eof = true;
             }
         }
 
-        let available = self.buffer.len() - self.offset;
+        let available = self.plaintext_buffer.len() - self.offset;
         let to_copy = min(available, buf.len());
-        buf[..to_copy].copy_from_slice(&self.buffer[self.offset..self.offset + to_copy]);
+        buf[..to_copy]
+            .copy_from_slice(&self.plaintext_buffer[self.offset..self.offset + to_copy]);
         self.offset += to_copy;
 
         Ok(to_copy)
@@ -240,7 +368,7 @@ fn main() -> Result<()> {
 fn pack(input_path: PathBuf, wipe: bool, level: i32, keyfile: Option<PathBuf>) -> Result<()> {
     let salt: [u8; 16] = rand::thread_rng().gen();
 
-    let key = process_credentials(&salt, keyfile)?;
+    let key = process_credentials(&salt, keyfile, true)?;
 
     let mut output_path = input_path.clone();
     if let Some(name) = input_path.file_name() {
@@ -306,11 +434,14 @@ fn pack(input_path: PathBuf, wipe: bool, level: i32, keyfile: Option<PathBuf>) -
         pb.finish_with_message("File packed");
     }
 
-    zstd_writer.finish()?;
+    let mut crypto_writer = zstd_writer.finish()?;
+    crypto_writer
+        .finalize()
+        .context("Failed to finalize encrypted stream")?;
 
     if wipe {
         print!(
-            "\nDelete original file/folder '{}'? (y/N): ",
+            "\nSecurely wipe original '{}'? (y/N): ",
             input_path.display()
         );
         std::io::stdout().flush()?;
@@ -321,12 +452,10 @@ fn pack(input_path: PathBuf, wipe: bool, level: i32, keyfile: Option<PathBuf>) -
             .context("Failed to read input")?;
 
         if input_string.trim().to_lowercase() == "y" {
-            if is_dir {
-                fs::remove_dir_all(&input_path).context("Failed to wipe directory")?;
-            } else {
-                fs::remove_file(&input_path).context("Failed to wipe file")?;
-            }
-            println!("Original data wiped.");
+            println!("Securely wiping (overwriting with random data)...");
+            secure_wipe_path(&input_path)
+                .context("Failed to securely wipe original data")?;
+            println!("Original data securely wiped.");
         } else {
             println!("Wipe cancelled. Original data preserved.");
         }
@@ -344,7 +473,7 @@ fn unpack(input_path: PathBuf, keyfile: Option<PathBuf>) -> Result<()> {
     input_file.read_exact(&mut salt)?;
     input_file.read_exact(&mut nonce)?;
 
-    let key = process_credentials(&salt, keyfile)?;
+    let key = process_credentials(&salt, keyfile, false)?;
 
     let key_struct = chacha20poly1305::Key::from_slice(&key);
     let aead = ChaCha20Poly1305::new(key_struct);
@@ -394,7 +523,7 @@ fn list(input_path: PathBuf, keyfile: Option<PathBuf>) -> Result<()> {
     input_file.read_exact(&mut salt)?;
     input_file.read_exact(&mut nonce)?;
 
-    let key = process_credentials(&salt, keyfile)?;
+    let key = process_credentials(&salt, keyfile, false)?;
 
     let key_struct = chacha20poly1305::Key::from_slice(&key);
     let aead = ChaCha20Poly1305::new(key_struct);

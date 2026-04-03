@@ -571,14 +571,13 @@ dependencies = [
 
 [[package]]
 name = "rstf"
-version = "2.0.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2",
  "bincode",
  "chacha20poly1305",
  "clap",
- "console",
  "indicatif",
  "num_cpus",
  "rand",
